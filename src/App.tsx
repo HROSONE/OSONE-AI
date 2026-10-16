@@ -98,6 +98,7 @@ import { getCounterfactualReasoningDirective, getSalienceEmpathyDirective } from
 import { getFranquezaDirective } from './lib/franquezaJarvis';
 import { buildCodeEditSystemInstruction, applyModelCodeResponse, pareceDocumentoIncompleto, substituirTrecho, contextoAoRedor } from './lib/codeEdits';
 import { INSTRUCAO_DE_PROJETO_MULTIARQUIVO, OSONE_CODE_MODELO_PRINCIPAL, lerArquivosDoModelo } from './lib/projetoMultiArquivo';
+import { MODELOS_OLLAMA_PADRAO } from './lib/ollama';
 import { gerarCodigoEmFluxo } from './lib/gerarCodigoEmFluxo';
 import { calcularQuadro } from './lib/qualidadeDaVisao';
 import { lerChatDaTela, montarInstrucaoDeLeitura, chaveDoComentario } from './lib/lerChatDaTela';
@@ -7660,6 +7661,16 @@ ${promptText}${maxEffort ? '\n\nESFORÇO MÁXIMO: capriche nos detalhes e nos ca
         model: apiKeys.osoneCodeAnthropicModel || 'claude-sonnet-5'
       };
     }
+    if (provedor === 'ollama') {
+      // Sem chave nenhuma: o modelo mora no computador do usuário e a URL também vem dele —
+      // é o navegador que conhece a máquina da placa (ou da falta dela), não este servidor.
+      return {
+        codeAiProvider: 'ollama',
+        ollamaUrl: apiKeys.osoneCodeOllamaUrl || '',
+        model: apiKeys.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO,
+        ollamaModel: apiKeys.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO
+      };
+    }
     return {
       codeAiProvider: 'gemini',
       clientApiKey: apiKeys.gemini || '',
@@ -14221,6 +14232,7 @@ IMPORTANTE PARA O AGENTE DE VOZ E CHAT:
                 onStartLiveVoice={() => startLiveSession()}
                 apiKeys={apiKeys}
                 onUpdateApiKeys={(patch) => setApiKeys(prev => ({ ...prev, ...patch }))}
+                localAgentToken={apiKeys.localAgentToken || ''}
                 isGenerating={isGenerating}
                 comandoDeVoz={pedidosDeVozDoCode[0]}
                 aoConcluirComandoDeVoz={concluirPedidoDeVozDoCode}

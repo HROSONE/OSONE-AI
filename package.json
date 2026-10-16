@@ -42,6 +42,7 @@
     "test:canto": "node scripts/conferir-canto-completo.mjs",
     "test:sons": "node scripts/conferir-biblioteca-sons.mjs",
     "test:chat-code": "node scripts/conferir-chat-code.mjs",
+    "test:ollama-code": "node --import tsx scripts/conferir-ollama-code.mjs",
     "test:pesquisa": "node scripts/conferir-osone-pesquisa.mjs",
     "test:cameras": "node scripts/conferir-cameras.mjs",
     "test:leitura-chat": "node scripts/conferir-leitura-de-chat.mjs",

@@ -189,3 +189,30 @@ A Vercel roda `server.ts` como uma função serverless (`api/index.ts`), que **n
 - **ElevenLabs**: já resolvido. Se o usuário configurar sua **própria chave da ElevenLabs** em Configurações do app, o navegador conecta **direto** na ElevenLabs (`wss://api.elevenlabs.io/...`), sem passar pelo nosso backend — funciona normalmente na Vercel. Sem chave própria, o app cai no proxy do backend usando a `ELEVENLABS_API_KEY` do `.env`/Vercel, que só funciona em hospedagem com servidor persistente (local, Electron, ou self-host fora da Vercel).
 - **Gemini Live**: já resolvido, com o mesmo princípio. Com **chave própria do Gemini** configurada em Configurações, o navegador conecta direto na API do Gemini (`src/lib/live-bridge.ts`) e funciona em qualquer hospedagem, inclusive Vercel. Sem chave própria, cai no proxy `/api/live-ws` do backend usando a `GEMINI_API_KEY` do servidor — só funciona com servidor persistente (não na Vercel). **Importante**: o backend nunca devolve a chave do servidor para o navegador em nenhum dos dois casos — se você não configurar sua própria chave, a voz em tempo real simplesmente não fica disponível na Vercel, em vez de expor a chave do `.env` para qualquer visitante do app.
 - **Handoff entre dispositivos** ("Transferir para Celular"): ainda depende do proxy WebSocket do backend e **não funciona quando deployado na Vercel** — funciona normalmente local, no Electron, ou em qualquer hospedagem com servidor Node persistente.
+
+---
+
+## 💻 OSONE CODE com modelo LOCAL (Ollama + Qwen Coder) — sem GPU, 8 GB de RAM
+
+O OSONE CODE pode programar usando um modelo **roda-do na sua própria máquina**, de graça e sem enviar código para nuvem nenhuma. O provedor se chama **Ollama** e o modelo padrão é o **`qwen2.5-coder:1.5b`** — escolhido exatamente para PCs modestos: sem placa de vídeo e com 8 GB de RAM ele cabe na memória e responde rápido. Na tela de seleção há opções mais pesadas (`3b`, `7b`, `14b`, `32b`), cada uma com o aviso honesto do que aperta em 8 GB.
+
+### Como usar
+1. Abra o **OSONE CODE** → Configurações da IA → escolha o provedor **Ollama (local)**.
+2. Aperte **"Instalar Ollama"** — o Agente Local baixa e instala o Ollama no Windows/macOS/Linux (só no instalável desktop, onde o Agente roda).
+3. Aperte **"Baixar qwen2.5-coder:1.5b"** (~1 GB) e acompanhe a barra de progresso na tela.
+4. Pronto: o CODE conversa com `http://127.0.0.1:11434` direto, com streaming, sem chave de API.
+
+### Segurança
+- **Só loopback**: o servidor recusa endereços que não sejam `127.x.x.x`, `::1` ou `localhost` (anti-SSRF). Se você publicar o OSONE num servidor, o provedor local fala com o Ollama **daquele servidor**, nunca com a rede interna de terceiros.
+- Os comandos de instalar/baixar passam pelo **token Bearer do Agente Local**, o mesmo das outras rotas privilegiadas.
+- Nomes de modelo são validados antes de virar argumento do `ollama pull`.
+
+### Conferindo sem instalar nada
+```bash
+npm run test:ollama-code
+```
+São 27 conferências determinísticas: modelo padrão leve, guarda anti-SSRF, roteamento no `server.ts`, rotas do Agente, token Bearer em todas as chamadas da tela e tipos. Não precisa de GPU nem de Ollama instalado.
+
+### Limites honestos
+- Modelo de 1.5B raciocina menos que os pagos: ótimo para autocomplete, trechos e arquivos pequenos; para projetos grandes, prefira subir para `7b` (se a máquina aguentar) ou continuar nos provedores de nuvem.
+- Na Vercel/serverless o provedor local não tem como funcionar (não há Ollama na função); use-o no app desktop ou self-host com servidor persistente.

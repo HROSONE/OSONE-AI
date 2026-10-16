@@ -36,11 +36,15 @@ export interface ApiKeys {
   googleCustomSearchCx?: string;
   tavilyApiKey?: string;
   localAgentToken?: string;
-  osoneCodeProvider?: 'gemini' | 'openai' | 'anthropic';
+  osoneCodeProvider?: 'gemini' | 'openai' | 'anthropic' | 'ollama';
   osoneCodeOpenAiApiKey?: string;
   osoneCodeOpenAiModel?: string;
   osoneCodeAnthropicApiKey?: string;
   osoneCodeAnthropicModel?: string;
+  /** Modelo local baixado pelo Ollama (ex.: 'qwen2.5-coder:1.5b'). Só tem sentido com o provedor 'ollama'. */
+  osoneCodeOllamaModel?: string;
+  /** Endereço do Ollama na máquina do usuário. Vazio = http://127.0.0.1:11434. */
+  osoneCodeOllamaUrl?: string;
 }
 
 export type OrbStyle = 'classic' | 'superintelligence' | 'neural' | 'shadow' | 'wave' | 'jarvis' | 'smoke';

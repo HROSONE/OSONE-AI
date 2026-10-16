@@ -31,6 +31,15 @@ import { cameraRouter, iniciarCamerasSalvas, pararTodasAsCameras } from "./src/s
 import { NaoRepetir } from "./src/lib/naoRepetir";
 import { acompanharClienteDoStream } from "./src/lib/clienteDoStream";
 import {
+  MODELOS_OLLAMA_PADRAO,
+  normalizarEnderecoDoOllama,
+  ehEnderecoLocalDoOllama,
+  montarPedidoOllama,
+  lerPecacoDoFluxoOllama,
+  emendarContinuacaoLocal,
+  motivoIndicaCorte,
+} from "./src/lib/ollama";
+import {
   carregarCredenciaisSalvas,
   lerEstadoDasCredenciais,
   salvarCredenciais
@@ -4511,12 +4520,143 @@ ${processedChunk}`;
     return [contents];
   }
 
-  type ProvedorDoOsoneCode = 'gemini' | 'openai' | 'anthropic';
+  type ProvedorDoOsoneCode = 'gemini' | 'openai' | 'anthropic' | 'ollama';
 
   function provedorAlternativoDoCode(body: any): ProvedorDoOsoneCode {
     const bruto = String(body?.codeAiProvider || body?.osoneCodeProvider || 'gemini').toLowerCase();
-    if (bruto === 'openai' || bruto === 'anthropic') return bruto;
+    if (bruto === 'openai' || bruto === 'anthropic' || bruto === 'ollama') return bruto;
     return 'gemini';
+  }
+
+  /**
+   * ====== MOTOR LOCAL: OLLAMA (QWEN CODER E COMPANHIA) ======
+   *
+   * O pedido chega com a URL do Ollama porque quem conhece a máquina da placa de vídeo é o
+   * navegador do usuário, não este servidor: instalado, o OSONE escuta em 0.0.0.0 e atende gente
+   * de outros computadores, e seria um erro (e um risco) gerar código contra um "localhost" que é
+   * o servidor. Por isso também a guarda: só endereços de loopback são aceitos — um OSONE público
+   * jamais pode virar ponte para o Ollama interno de quem o hospeda (SSRF).
+   */
+  async function gerarComOllamaParaCode(
+    body: any,
+    onPedaco?: (texto: string) => void
+  ): Promise<{ text: string; finishReason?: string; truncated: boolean; modeloUsado: string }> {
+    const enderecoBruto = String(body.ollamaUrl || '').trim();
+    if (!ehEnderecoLocalDoOllama(enderecoBruto)) {
+      throw new Error(`Ollama local só aceita endereços da própria máquina (127.0.0.1/localhost). Recebido: "${enderecoBruto.slice(0, 80)}".`);
+    }
+    const base = normalizarEnderecoDoOllama(enderecoBruto);
+    const modelo = String(body.model || body.ollamaModel || MODELOS_OLLAMA_PADRAO).trim();
+    const entrada = extrairPromptMultimodal(body.prompt ?? body.contents);
+    const imagens = Math.round((entrada.imagens.reduce((soma, img) => soma + img.data.length, 0) / 1024) * 0.75);
+    if (entrada.imagens.length > 0) {
+      console.warn(`[Ollama] ${entrada.imagens.length} imagem(ns) de referência (~${imagens} KB em base64) desconsideradas: o modelo local recebe só o texto.`);
+    }
+
+    // Como nos motores pagos, o teto alto entra APENAS quando o esforço máximo foi pedido — que é
+    // exatamente o botão "Esforço máximo" da aba. Assim o usuário controla o tamanho do arquivo
+    // gerado pela própria GPU sem depender de variável de ambiente no servidor.
+    const corpo = montarPedidoOllama({
+      modelo,
+      prompt: entrada.texto,
+      systemInstruction: body.systemInstruction ? String(body.systemInstruction) : undefined,
+      stream: Boolean(onPedaco),
+      tetoDeTokens: (body.unrestricted || body.maxEffort) ? TETO_DE_SAIDA_PARA_CODIGO : undefined,
+    });
+
+    let resposta: Response;
+    try {
+      resposta = await fetch(`${base}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(corpo),
+        signal: AbortSignal.timeout(30 * 60 * 1000),
+      });
+    } catch (err: any) {
+      throw new Error(
+        `Não foi possível falar com o Ollama em ${base}. Ele está rodando? ` +
+        `Abra um terminal e rode "ollama serve", ou use o botão de instalação do OSONE CODE. (${err?.message || err})`
+      );
+    }
+
+    if (!resposta.ok) {
+      const detalhe = await resposta.text().catch(() => '');
+      throw new Error(`Ollama (${resposta.status}): ${detalhe.slice(0, 300) || 'falha na geração'}`);
+    }
+
+    let texto = '';
+    let motivoParada: string | undefined;
+    if (onPedaco && resposta.body) {
+      const leitor = resposta.body.getReader();
+      const decodificador = new TextDecoder();
+      let sobra = '';
+      for (;;) {
+        const { done, value } = await leitor.read();
+        if (done) break;
+        sobra += decodificador.decode(value, { stream: true });
+        const linhas = sobra.split('\n');
+        sobra = linhas.pop() || '';
+        for (const linha of linhas) {
+          const pedaco = lerPecacoDoFluxoOllama(linha);
+          if (pedaco.texto) { texto += pedaco.texto; onPedaco(pedaco.texto); }
+          if (pedaco.done) { motivoParada = pedaco.motivo; }
+        }
+      }
+      if (sobra.trim()) {
+        const pedaco = lerPecacoDoFluxoOllama(sobra);
+        if (pedaco.texto) texto += pedaco.texto;
+        if (pedaco.done) motivoParada = pedaco.motivo;
+      }
+    } else {
+      const dados: any = await resposta.json().catch(() => null);
+      texto = typeof dados?.response === 'string' ? dados.response : '';
+      motivoParada = typeof dados?.done_reason === 'string' ? dados.done_reason : undefined;
+    }
+
+    const truncated = motivoIndicaCorte(motivoParada);
+    return { text: texto, finishReason: motivoParada, truncated, modeloUsado: modelo };
+  }
+
+  /** Instrução mandando o modelo local continuar de onde parou (mesma regra dos motores pagos). */
+  const INSTRUCAO_PARA_CONTINUAR_LOCAL = `Sua resposta anterior foi CORTADA por limite de tokens, no meio. CONTINUE EXATAMENTE do ponto onde parou, sem repetir nada do que já escreveu, sem saudação, sem cercas de markdown, e feche todas as tags, funções e blocos abertos.`;
+
+  /**
+   * Gera com o Ollama e, se a resposta vier cortada, manda continuar até fechar o arquivo — o
+   * mesmo cuidado que a geração Gemini recebe, agora para os modelos locais, que cortam ainda
+   * mais cedo por terem janelas menores.
+   */
+  async function gerarComOllamaAteOFim(
+    body: any,
+    onPedaco?: (texto: string) => void
+  ): Promise<{ text: string; finishReason?: string; truncated: boolean; modeloUsado: string; continuacoes: number }> {
+    const primeira = await gerarComOllamaParaCode(body, onPedaco);
+    let texto = primeira.text || '';
+    let truncated = primeira.truncated;
+    let continuacoes = 0;
+    const limite = Number(body.unrestricted || body.maxEffort) ? MAXIMO_DE_CONTINUACOES : 0;
+
+    while (truncated && continuacoes < limite && texto.trim()) {
+      continuacoes++;
+      console.warn(`[Ollama] Resposta cortada. Pedindo continuação ${continuacoes}/${limite}...`);
+      const corpoDaContinuacao = { ...body, prompt: `${texto}\n\n${INSTRUCAO_PARA_CONTINUAR_LOCAL}` };
+      let seguinte: any;
+      try {
+        seguinte = await gerarComOllamaParaCode(corpoDaContinuacao, onPedaco);
+      } catch (err: any) {
+        // Falhar a continuação não apaga o que já foi escrito: entrega o pedaço existente, cortado.
+        console.error(`[Ollama] Falha ao continuar a geração:`, err?.message || err);
+        break;
+      }
+      const antes = texto.length;
+      texto = emendarContinuacaoLocal(texto, tirarCercaDeAbertura(seguinte.text || ''));
+      truncated = seguinte.truncated;
+      if (texto.length <= antes) {
+        console.warn(`[Ollama] A continuação não acrescentou texto novo. Parando aqui.`);
+        break;
+      }
+      if (onPedaco) { /* os pedaços novos já foram emitidos dentro de gerarComOllamaParaCode */ }
+    }
+    return { text: texto, finishReason: primeira.finishReason, truncated, modeloUsado: primeira.modeloUsado, continuacoes };
   }
 
   function extrairPromptMultimodal(contents: any): {
@@ -5027,6 +5167,19 @@ CONTINUE EXATAMENTE do ponto onde parou, como se nunca tivesse havido interrupç
           provedorUsado: 'anthropic'
         });
       }
+      if (provedorCode === 'ollama') {
+        const resposta = await gerarComOllamaAteOFim(req.body);
+        return res.json({
+          text: resposta.text || "",
+          finishReason: resposta.finishReason,
+          blocked: false,
+          truncated: resposta.truncated,
+          continuacoes: resposta.continuacoes,
+          modeloUsado: resposta.modeloUsado,
+          modeloPreferido: resposta.modeloUsado,
+          provedorUsado: 'ollama'
+        });
+      }
       const apiKey = clientApiKey || getSecretGeminiKey();
 
       if (!apiKey) {
@@ -5148,23 +5301,43 @@ CONTINUE EXATAMENTE do ponto onde parou, como se nunca tivesse havido interrupç
       };
 
       try {
-        const resposta = provedorCode === 'openai'
-          ? await gerarComOpenAiParaCode(req.body)
-          : await gerarComAnthropicParaCode(req.body);
+        if (provedorCode === 'ollama') {
+          // O motor local já sabe mandar pedaço em pedaço — aqui cada fragmento vira um evento
+          // SSE, então o editor do CODE acompanha o Qwen escrevendo em vez de ficar parado até o
+          // fim (num PC sem GPU a espera é longa, e sem fluxo não dá para distinguir "pensando"
+          // de "travou").
+          const resposta = await gerarComOllamaAteOFim(req.body, (pedaco) => enviar({ text: pedaco }));
+          enviar({ modeloUsado: resposta.modeloUsado, modeloPreferido: resposta.modeloUsado, provedorUsado: 'ollama' });
+          enviar({
+            done: true,
+            text: resposta.text || "",
+            finishReason: resposta.finishReason,
+            blocked: false,
+            truncated: resposta.truncated,
+            continuacoes: resposta.continuacoes,
+            modeloUsado: resposta.modeloUsado,
+            modeloPreferido: resposta.modeloUsado,
+            provedorUsado: 'ollama'
+          });
+        } else {
+          const resposta = provedorCode === 'openai'
+            ? await gerarComOpenAiParaCode(req.body)
+            : await gerarComAnthropicParaCode(req.body);
 
-        enviar({ modeloUsado: resposta.modeloUsado, modeloPreferido: resposta.modeloUsado, provedorUsado: provedorCode });
-        if (resposta.text) enviar({ text: resposta.text });
-        enviar({
-          done: true,
-          text: resposta.text || "",
-          finishReason: resposta.finishReason,
-          blocked: false,
-          truncated: resposta.truncated,
-          continuacoes: 0,
-          modeloUsado: resposta.modeloUsado,
-          modeloPreferido: resposta.modeloUsado,
-          provedorUsado: provedorCode
-        });
+          enviar({ modeloUsado: resposta.modeloUsado, modeloPreferido: resposta.modeloUsado, provedorUsado: provedorCode });
+          if (resposta.text) enviar({ text: resposta.text });
+          enviar({
+            done: true,
+            text: resposta.text || "",
+            finishReason: resposta.finishReason,
+            blocked: false,
+            truncated: resposta.truncated,
+            continuacoes: 0,
+            modeloUsado: resposta.modeloUsado,
+            modeloPreferido: resposta.modeloUsado,
+            provedorUsado: provedorCode
+          });
+        }
       } catch (err: any) {
         console.error("Error inside /api/generate-stream endpoint:", err);
         enviar({ error: sanitizeMessageOfKeys(err?.message || String(err)) });

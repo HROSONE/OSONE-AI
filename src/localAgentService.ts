@@ -4,12 +4,17 @@ import os from 'os';
 import http from 'http';
 import vm from 'vm';
 import crypto from 'crypto';
-import { exec, execFile, spawn } from 'child_process';
+import { exec, execFile, execSync, spawn } from 'child_process';
 import { Request, Response, NextFunction, Router } from 'express';
 import {
   ehEndereco, normalizarEndereco, pareceNomeDePrograma, NAVEGADORES_DO_AGENTE, NOME_DO_PERFIL
 } from './lib/navegadorDoAgente';
 import { SondaDeDisco, CaminhoResolvido, resolverCaminho } from './lib/caminhoDoSistema';
+import {
+  MODELOS_OLLAMA_PADRAO,
+  comandoDeInstalacaoDoOllama,
+  nomeDeModeloValido,
+} from './lib/ollama';
 
 // ============================================================================
 // SEÇÃO 1: CONFIGURAÇÃO E INICIALIZAÇÃO
@@ -3647,6 +3652,242 @@ const handleWindowCapture = async (req: Request, res: Response) => {
   }
 };
 
+// ============================================================================
+// SEÇÃO 15: OLLAMA LOCAL — INSTALAR, BAIXAR O QWEN E VERIFICAR (OSONE CODE OFFLINE)
+// ============================================================================
+
+/**
+ * Ache o binário `ollama` mesmo quando ele não está no PATH do processo.
+ *
+ * No Windows o instalador coloca em %LOCALAPPDATA%\Programs\Ollama e não atualiza o PATH de um
+ * processo que já estava aberto; no Linux com a instalação sem systemd/binário solto o mesmo
+ * acontece. Sem esta busca, o OSONE concluiria "Ollama não instalado" numa máquina onde ele foi
+ * instalado pelo próprio botão minutos antes.
+ */
+function localizarBinarioDoOllama(): string | null {
+  try {
+    const saida = execSync(process.platform === 'win32' ? 'where ollama' : 'command -v ollama', {
+      timeout: 5000, windowsHide: true, encoding: 'utf-8'
+    });
+    const primeiro = saida.split(/\r?\n/).map(l => l.trim()).find(Boolean);
+    if (primeiro && fs.existsSync(primeiro)) return primeiro;
+  } catch { /* não está no PATH — ainda há candidatos fixos abaixo */ }
+
+  const candidatos: string[] = [];
+  if (process.platform === 'win32') {
+    const local = process.env.LOCALAPPDATA || path.join(USER_HOME_DIR, 'AppData', 'Local');
+    candidatos.push(path.join(local, 'Programs', 'Ollama', 'ollama.exe'));
+  } else {
+    candidatos.push('/usr/local/bin/ollama', '/usr/bin/ollama', path.join(USER_HOME_DIR, '.ollama', 'bin', 'ollama'));
+  }
+  for (const candidato of candidatos) {
+    try { if (fs.existsSync(candidato)) return candidato; } catch { /* segue procurando */ }
+  }
+  return null;
+}
+
+/** Roda `ollama <args>` direto no binário, sem interpolação de shell. */
+async function executarOllama(args: string[], timeoutMs: number): Promise<string> {
+  const bin = localizarBinarioDoOllama();
+  if (!bin) throw new Error('Ollama não encontrado neste computador.');
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) return reject(new Error(stderr?.toString().trim() || error.message));
+      resolve(stdout?.toString() || '');
+    });
+  });
+}
+
+/** GET /ollama/status — o que existe, o que roda e quais modelos já foram baixados. */
+const handleOllamaStatus = async (_req: Request, res: Response) => {
+  const binario = localizarBinarioDoOllama();
+  let servidorRespondendo = false;
+  try {
+    const resposta = await fetch('http://127.0.0.1:11434/api/version', { signal: AbortSignal.timeout(3000) });
+    servidorRespondendo = resposta.ok;
+  } catch { /* servidor parado é estado normal aqui, não erro */ }
+
+  let modelosBaixados: string[] = [];
+  if (binario) {
+    try {
+      const saida = await executarOllama(['list'], 15000);
+      modelosBaixados = saida.split(/\r?\n/).slice(1)
+        .map(linha => linha.trim().split(/\s+/)[0]).filter(Boolean);
+    } catch (err: any) {
+      logAudit('WARN', 'OLLAMA_LIST_FALHOU', `Não foi possível listar os modelos do Ollama: ${err?.message}`);
+    }
+  }
+
+  const mensagem = !binario
+    ? 'Ollama não está instalado neste computador. Use o botão de instalação do OSONE CODE.'
+    : !servidorRespondendo
+      ? 'Ollama instalado, mas o servidor não está respondendo na porta 11434.'
+      : 'Servidor local pronto para gerar código.';
+
+  logAudit('INFO', 'OLLAMA_STATUS', `Estado do Ollama consultado`, { binario, servidorRespondendo, totalModelos: modelosBaixados.length });
+  return res.status(200).json({
+    plataforma: process.platform,
+    instalado: Boolean(binario),
+    caminhoDoBinario: binario || undefined,
+    servidorRespondendo,
+    endpointVerificado: 'http://127.0.0.1:11434',
+    modelosBaixados,
+    qwenDisponivel: modelosBaixados.some(m => m.startsWith('qwen')),
+    mensagem,
+  });
+};
+
+interface ProgressoDeDownloadDoOllama {
+  modelo: string;
+  status: string;
+  baixado: number;
+  total: number;
+  percentual: number;
+  iniciadoEm: number;
+  terminadoEm?: number;
+  erro?: string;
+}
+
+/**
+ * Um download por modelo, acompanhado pela interface.
+ *
+ * O `ollama pull` imprime uma linha de progresso a cada atualização — JSON puro, terminando com
+ * {"done":true}. Guardamos o último estado num mapa em memória para que a tela possa perguntar
+ * "quanto falta?" enquanto o processo roda desanexado, e para que um segundo clique no botão não
+ * inicie um segundo download do mesmo arquivo.
+ */
+const downloadsDeModeloDoOllama = new Map<string, ProgressoDeDownloadDoOllama>();
+
+function iniciarDownloadDeModeloDoOllama(modelo: string): ProgressoDeDownloadDoOllama {
+  const registro: ProgressoDeDownloadDoOllama = {
+    modelo, status: 'iniciando', baixado: 0, total: 0, percentual: 0, iniciadoEm: Date.now()
+  };
+  downloadsDeModeloDoOllama.set(modelo, registro);
+
+  const bin = localizarBinarioDoOllama();
+  if (!bin) {
+    registro.status = 'erro';
+    registro.erro = 'Ollama não encontrado neste computador.';
+    registro.terminadoEm = Date.now();
+    return registro;
+  }
+
+  const filho = spawn(bin, ['pull', modelo], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let sobraDeLinha = '';
+  const absorver = (pedaco: Buffer) => {
+    sobraDeLinha += pedaco.toString('utf-8');
+    const linhas = sobraDeLinha.split(/\r?\n/);
+    sobraDeLinha = linhas.pop() || '';
+    for (const linha of linhas) {
+      const texto = linha.trim();
+      if (!texto.startsWith('{')) continue;
+      try {
+        const dado = JSON.parse(texto);
+        if (typeof dado.status === 'string') registro.status = dado.status;
+        if (typeof dado.completed === 'number') registro.baixado = dado.completed;
+        if (typeof dado.total === 'number' && dado.total > 0) {
+          registro.total = dado.total;
+          registro.percentual = Math.min(100, Math.round((registro.baixado / registro.total) * 100));
+        }
+      } catch { /* linha parcial ou não-JSON: nada a registrar */ }
+    }
+  };
+  filho.stdout?.on('data', absorver);
+  filho.stderr?.on('data', absorver);
+  filho.on('error', (err) => {
+    registro.status = 'erro';
+    registro.erro = err.message;
+    registro.terminadoEm = Date.now();
+    logAudit('ERROR', 'OLLAMA_PULL_FALHOU', `Falha ao baixar ${modelo}: ${err.message}`);
+  });
+  filho.on('close', (code) => {
+    if (registro.status !== 'erro') {
+      registro.status = code === 0 ? 'concluído' : 'falhou';
+      if (code === 0) registro.percentual = 100;
+    }
+    registro.terminadoEm = Date.now();
+    logAudit('INFO', 'OLLAMA_PULL_ENCERRADO', `Download de ${modelo} encerrou`, { code, status: registro.status });
+  });
+  filho.unref();
+  return registro;
+}
+
+/** POST /ollama/instalar — baixa e instala o Ollama oficial neste computador. */
+const handleOllamaInstalar = async (req: Request, res: Response) => {
+  const binario = localizarBinarioDoOllama();
+  if (binario) {
+    return res.status(200).json({
+      success: true, jaInstalado: true, caminho: binario,
+      message: 'Ollama já está instalado neste computador.'
+    });
+  }
+
+  const plano = comandoDeInstalacaoDoOllama(process.platform);
+  if (!plano) {
+    return res.status(501).json({ error: `Instalação automática não suportada na plataforma '${process.platform}'. Instale manualmente a partir de https://ollama.com/download.` });
+  }
+
+  // Terminal visível: a instalação mexe no sistema (baixa centenas de MB, pode pedir senha no
+  // macOS/Linux) e esconder isso seria a receita perfeita para "não aconteceu nada".
+  try {
+    if (process.platform === 'win32') {
+      launchDetached(`start "OSONE - Instalando Ollama" cmd /K "${plano.command.replace(/"/g, '""')}"`, USER_HOME_DIR);
+    } else if (process.platform === 'darwin') {
+      const escaped = plano.command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      launchDetached(`osascript -e 'tell application "Terminal" to do script "${escaped}"' -e 'tell application "Terminal" to activate'`, USER_HOME_DIR);
+    } else {
+      const shellCmd = `${plano.command}; echo; echo '[OSONE] Instalação do Ollama finalizada. Feche esta janela.']`;
+      const escaped = shellCmd.replace(/'/g, `'\\''`);
+      await tryCommandsInOrder([
+        `gnome-terminal -- bash -c '${escaped}'`,
+        `konsole -e bash -c '${escaped}'`,
+        `xfce4-terminal -e "bash -c '${escaped}'"`,
+        `xterm -hold -e bash -c '${escaped}'`,
+      ], USER_HOME_DIR);
+    }
+  } catch (err: any) {
+    logAudit('ERROR', 'OLLAMA_INSTALAR_FALHOU', err?.message || String(err));
+    return res.status(500).json({ error: `Não foi possível abrir a instalação do Ollama: ${err?.message || err}` });
+  }
+
+  logAudit('INFO', 'OLLAMA_INSTALACAO_INICIADA', `Instalação do Ollama aberta em terminal visível`, { metodo: plano.metodo });
+  return res.status(200).json({
+    success: true,
+    started: true,
+    message: `Instalação do Ollama iniciada (${plano.metodo}) numa janela de terminal. Quando terminar, volte ao OSONE CODE e clique em "Instalar modelo Qwen".`,
+  });
+};
+
+/** POST /ollama/baixar-modelo — puxa o Qwen escolhido pelo usuário, com progresso observável. */
+const handleOllamaBaixarModelo = async (req: Request, res: Response) => {
+  const modelo = String(req.body?.modelo || MODELOS_OLLAMA_PADRAO).trim();
+  if (!nomeDeModeloValido(modelo)) {
+    return res.status(400).json({ error: `Nome de modelo inválido: "${modelo.slice(0, 60)}". Use algo como "qwen2.5-coder:7b".` });
+  }
+  if (!localizarBinarioDoOllama()) {
+    return res.status(400).json({ error: 'Ollama não está instalado neste computador. Instale-o primeiro pelo botão do OSONE CODE.' });
+  }
+
+  const existente = downloadsDeModeloDoOllama.get(modelo);
+  if (existente && !existente.terminadoEm) {
+    return res.status(200).json({ ...existente, emAndamento: true, message: `O download de ${modelo} já está em andamento.` });
+  }
+
+  const registro = iniciarDownloadDeModeloDoOllama(modelo);
+  logAudit('INFO', 'OLLAMA_PULL_SOLICITADO', `Download do modelo ${modelo} iniciado pela interface do OSONE CODE`);
+  return res.status(200).json({ ...registro, message: `Baixando ${modelo}. Acompanhe o progresso na tela do OSONE CODE.` });
+};
+
+/** GET /ollama/progresso?modelo=... — quanto falta para o download terminar. */
+const handleOllamaProgresso = (req: Request, res: Response) => {
+  const modelo = String(req.query?.modelo || MODELOS_OLLAMA_PADRAO).trim();
+  const registro = downloadsDeModeloDoOllama.get(modelo);
+  if (!registro) {
+    return res.status(200).json({ modelo, status: 'inexistente', percentual: 0, mensagem: `Nenhum download de ${modelo} foi iniciado nesta sessão.` });
+  }
+  return res.status(200).json(registro);
+};
+
 // Mapeamento das rotas no router
 agentRouter.get('/status', handleStatus);
 agentRouter.post('/desktop/start', handleDesktopStart);
@@ -3684,6 +3925,12 @@ agentRouter.post('/mouse/scroll', handleMouseScroll);
 agentRouter.post('/keyboard/type', handleKeyboardType);
 agentRouter.post('/keyboard/key', handleKeyboardKey);
 agentRouter.get('/screen/capture', handleScreenCapture);
+
+// Rotas do Ollama local (OSONE CODE com modelo na própria máquina)
+agentRouter.get('/ollama/status', handleOllamaStatus);
+agentRouter.post('/ollama/instalar', handleOllamaInstalar);
+agentRouter.post('/ollama/baixar-modelo', handleOllamaBaixarModelo);
+agentRouter.get('/ollama/progresso', handleOllamaProgresso);
 
 /**
  * GET /diagnostico-mira — mostra os últimos movimentos de mouse: o que foi pedido, onde o cursor

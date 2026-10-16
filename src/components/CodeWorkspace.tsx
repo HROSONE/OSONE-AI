@@ -24,6 +24,7 @@ import { analisarFullstackDoCode, arquivosDeSuporteFullstack } from '../lib/full
 import { compararProjeto, apenasOsTrechosQueMudaram, ComparacaoDeArquivo } from '../lib/compararCodigo';
 import { caminhoDisponivel, chaveDeCaminho, nomeBaseDoCaminho, normalizarCaminhoDoCode, pastaDoCaminho } from '../lib/caminhosDoCode';
 import { GithubImportResult } from '../lib/githubDoCode';
+import { MODELOS_OLLAMA_PADRAO, OPGOES_DE_MODELO_OLLAMA } from '../lib/ollama';
 
 // Geração/edição de código (Hunter e Enxame/Swarm) sempre usa o melhor modelo disponível para
 // código, independente do modelo configurado nos Ajustes gerais do chat. A constante vive em
@@ -606,12 +607,19 @@ export const CodeWorkspace: React.FC<{
   onCodeChatContextChange?: (contexto: string) => void;
   apiKeys?: ApiKeys;
   onUpdateApiKeys?: (patch: Partial<ApiKeys>) => void;
+  /**
+   * Token do Agente Local, necessário para as rotas /api/agent/ollama/* (instalar o Ollama e
+   * baixar o Qwen exigem Bearer). O App já provisiona este token sozinho; aqui ele só entra
+   * como prop para que a aba do CODE consiga falar com o agente — sem ele, todo download
+   * morreria em 401.
+   */
+  localAgentToken?: string;
   isGenerating?: boolean;
   /** Primeiro pedido aguardando na fila criada pela ferramenta de voz. */
   comandoDeVoz?: { id: string; prompt: string };
   /** Remove da fila somente depois que o editor terminou de aplicar (ou relatar a falha). */
   aoConcluirComandoDeVoz?: (id: string) => void;
-}> = ({ onClose, onGenerateCodeRequest, onStartLiveVoice, apiKeys, onUpdateApiKeys, isGenerating,
+}> = ({ onClose, onGenerateCodeRequest, onStartLiveVoice, apiKeys, onUpdateApiKeys, localAgentToken, isGenerating,
   comandoDeVoz, aoConcluirComandoDeVoz, onCodeChatRequest, onCodeChatContextChange }) => {
   // 5 PROJECTS MANAGEMENT
   const [projects, setProjects] = useState<OSONEProject[]>(() => {
@@ -850,6 +858,93 @@ export const CodeWorkspace: React.FC<{
   // HUNTER AGENT STATE
   const [isHunterModalOpen, setIsHunterModalOpen] = useState<boolean>(false);
   const [isCodeApiSettingsOpen, setIsCodeApiSettingsOpen] = useState<boolean>(false);
+
+  /**
+   * ====== OLLAMA LOCAL: ACOMPANHAR O DOWNLOAD DO QWEN PELA TELA ======
+   *
+   * Baixar um modelo são centenas de MB (o 1.5B) a gigabytes. Sem progresso na tela é "travou ou
+   * instalou?"; por isso o botão dispara o pull no Agente Local e fica perguntando o percentual a
+   * cada dois segundos até o processo terminar (ou dar erro). Os estados vivem aqui porque só a
+   * aba do CODE usa o motor local — nada disso vaza para os provedores pagos.
+   */
+  const [ollamaBaixando, setOllamaBaixando] = useState<{ modelo: string; status: string; percentual: number } | null>(null);
+  const [ollamaAviso, setOllamaAviso] = useState<string>('');
+
+  useEffect(() => {
+    if (!ollamaBaixando) return;
+    let cancelado = false;
+    const temporizador = setInterval(async () => {
+      try {
+        const resposta = await fetch(`/api/agent/ollama/progresso?modelo=${encodeURIComponent(ollamaBaixando.modelo)}`, {
+          headers: localAgentToken ? { 'Authorization': `Bearer ${localAgentToken}` } : undefined,
+        });
+        const dado = await resposta.json().catch(() => ({} as any));
+        if (cancelado) return;
+        if (dado?.status === 'concluído') {
+          setOllamaBaixando(null);
+          setOllamaAviso(`✅ ${dado.modelo} está pronto. Pode gerar código com ele agora.`);
+        } else if (dado?.status === 'erro' || dado?.status === 'falhou' || dado?.status === 'inexistente') {
+          setOllamaBaixando(null);
+          setOllamaAviso(`⚠️ ${dado.erro || `O download de ${dado.modelo} não pôde continuar.`} O Ollama está instalado e rodando neste computador?`);
+        } else {
+          setOllamaBaixando({ modelo: dado.modelo || ollamaBaixando.modelo, status: String(dado.status || 'baixando'), percentual: Number(dado.percentual) || 0 });
+        }
+      } catch { /* agente fora do ar: tenta de novo no próximo tique; o botão continua mostrando o último estado */ }
+    }, 2000);
+    return () => { cancelado = true; clearInterval(temporizador); };
+  }, [ollamaBaixando?.modelo]);
+
+  /**
+   * Instala o Ollama neste computador com um clique, pela rota /ollama/instalar do Agente Local.
+   *
+   * A alternativa era mandar o usuário caçar ollama.com/download no navegador — e quem não tem
+   * GPU justamente é quem menos sabe que precisa fazer isso. O agente abre um terminal visível
+   * com o instalador oficial; quando terminar, o botão de baixar o modelo passa a funcionar.
+   */
+  const instalarOllamaPelaInterface = async () => {
+    setOllamaAviso('');
+    try {
+      const resposta = await fetch('/api/agent/ollama/instalar', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(localAgentToken ? { 'Authorization': `Bearer ${localAgentToken}` } : {}),
+        },
+      });
+      const dado = await resposta.json().catch(() => ({} as any));
+      if (!resposta.ok) {
+        setOllamaAviso(`⚠️ ${dado?.error || 'O Agente Local recusou a instalação.'}`);
+        return;
+      }
+      setOllamaAviso(dado?.message || 'Instalação do Ollama iniciada numa janela de terminal. Quando terminar, baixe o modelo.');
+    } catch (e: any) {
+      setOllamaAviso(`⚠️ Não foi possível falar com o Agente Local (${e?.message || e}). Ele roda no mesmo computador que você abriu o OSONE CODE.`);
+    }
+  };
+
+  const baixarModeloDoOllamaPelaInterface = async () => {
+    const modelo = apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO;
+    setOllamaAviso('');
+    try {
+      const resposta = await fetch('/api/agent/ollama/baixar-modelo', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(localAgentToken ? { 'Authorization': `Bearer ${localAgentToken}` } : {}),
+        },
+        body: JSON.stringify({ modelo }),
+      });
+      const dado = await resposta.json().catch(() => ({} as any));
+      if (!resposta.ok) {
+        setOllamaAviso(`⚠️ ${dado?.error || 'O Agente Local recusou o download.'}`);
+        return;
+      }
+      setOllamaBaixando({ modelo, status: dado?.status || 'iniciando', percentual: Number(dado?.percentual) || 0 });
+    } catch (e: any) {
+      setOllamaAviso(`⚠️ Não foi possível falar com o Agente Local (${e?.message || e}). Ele roda no mesmo computador que você abriu o OSONE CODE.`);
+    }
+  };
+
   const [isGithubPanelOpen, setIsGithubPanelOpen] = useState<boolean>(false);
   // O seletor de projeto virou um botão só, na barra superior: ele mostra o projeto ativo e
   // abre a lista para trocar/renomear, em vez de gastar uma faixa inteira da tela com pastilhas.
@@ -1870,12 +1965,16 @@ Responda APENAS um array JSON de 4 strings. Exemplo do formato:
     ? 'ChatGPT/OpenAI'
     : provedorDoCode === 'anthropic'
       ? 'Claude'
-      : 'Gemini padrão';
+      : provedorDoCode === 'ollama'
+        ? 'Ollama (local)'
+        : 'Gemini padrão';
   const modeloDoProvedorDoCode = provedorDoCode === 'openai'
     ? (apiKeys?.osoneCodeOpenAiModel || 'gpt-5.5')
     : provedorDoCode === 'anthropic'
       ? (apiKeys?.osoneCodeAnthropicModel || 'claude-sonnet-5')
-      : OSONE_CODE_BEST_MODEL;
+      : provedorDoCode === 'ollama'
+        ? (apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO)
+        : OSONE_CODE_BEST_MODEL;
 
   const montarConfigDaApiDoCode = (forcarLeve = false): Record<string, unknown> => {
     if (provedorDoCode === 'openai') {
@@ -1890,6 +1989,17 @@ Responda APENAS um array JSON de 4 strings. Exemplo do formato:
         codeAiProvider: 'anthropic',
         anthropicApiKey: apiKeys?.osoneCodeAnthropicApiKey || '',
         model: apiKeys?.osoneCodeAnthropicModel || 'claude-sonnet-5'
+      };
+    }
+    if (provedorDoCode === 'ollama') {
+      // Caça-níquel de custo zero: nada de chave, nada de cota. A URL viaja no pedido porque é o
+      // navegador do usuário que sabe onde o Ollama dele escuta (o servidor pode estar em outro
+      // computador).
+      return {
+        codeAiProvider: 'ollama',
+        ollamaUrl: apiKeys?.osoneCodeOllamaUrl || '',
+        model: apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO,
+        ollamaModel: apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO
       };
     }
     return {
@@ -3185,11 +3295,12 @@ FORMATO OBRIGATÓRIO (JSON estrito):
               </div>
 
               <div className="p-5 space-y-5">
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {[
                     { id: 'gemini', label: 'Gemini padrão', desc: 'Usa a chave Gemini do OSONE/usuário' },
                     { id: 'openai', label: 'ChatGPT/OpenAI', desc: 'Cobra na conta OpenAI da chave informada' },
-                    { id: 'anthropic', label: 'Claude', desc: 'Cobra na conta Anthropic da chave informada' }
+                    { id: 'anthropic', label: 'Claude', desc: 'Cobra na conta Anthropic da chave informada' },
+                    { id: 'ollama', label: 'Ollama (local)', desc: 'Qwen Coder grátis, rodando neste computador' }
                   ].map((opcao) => (
                     <button
                       key={opcao.id}
@@ -3261,6 +3372,73 @@ FORMATO OBRIGATÓRIO (JSON estrito):
                         className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white outline-none focus:border-cyan-400/60"
                       />
                     </label>
+                  </div>
+                )}
+
+                {provedorDoCode === 'ollama' && (
+                  <div className="space-y-3">
+                    <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs text-emerald-100 leading-relaxed">
+                      <strong>Motor local — custo zero.</strong> O código é gerado pelo Qwen rodando neste computador,
+                      sem chave de API e sem internet. Ele aceita só endereços da própria máquina (127.0.0.1), então um
+                      OSONE publicado nunca usa o seu Ollama — nem o contrário. Em PC sem GPU com 8 GB de RAM, fique no
+                      1.5B: os maiores trocam memória e ficam lentos demais.
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <label className="space-y-1.5">
+                        <span className="text-[11px] uppercase tracking-[0.18em] text-zinc-500 font-mono">Modelo local</span>
+                        <select
+                          value={apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO}
+                          onChange={(e) => onUpdateApiKeys?.({ osoneCodeOllamaModel: e.target.value })}
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white outline-none focus:border-cyan-400/60"
+                        >
+                          {OPGOES_DE_MODELO_OLLAMA.map((m) => (
+                            <option key={m.id} value={m.id}>{m.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1.5">
+                        <span className="text-[11px] uppercase tracking-[0.18em] text-zinc-500 font-mono">Endereço do Ollama</span>
+                        <input
+                          value={apiKeys?.osoneCodeOllamaUrl || ''}
+                          onChange={(e) => onUpdateApiKeys?.({ osoneCodeOllamaUrl: e.target.value })}
+                          placeholder="http://127.0.0.1:11434"
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white outline-none focus:border-cyan-400/60"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="text-[11px] text-zinc-500 leading-relaxed">
+                      {OPGOES_DE_MODELO_OLLAMA.find((m) => m.id === (apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO))?.desc}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        onClick={instalarOllamaPelaInterface}
+                        className="w-full px-4 py-2.5 rounded-xl bg-white/[0.06] border border-white/15 text-zinc-200 text-xs font-mono font-bold hover:bg-white/[0.12] transition-colors"
+                      >
+                        Instalar o Ollama neste PC
+                      </button>
+                      <button
+                        onClick={baixarModeloDoOllamaPelaInterface}
+                        disabled={Boolean(ollamaBaixando)}
+                        className="w-full px-4 py-2.5 rounded-xl bg-emerald-500/15 border border-emerald-400/40 text-emerald-100 text-xs font-mono font-bold hover:bg-emerald-500/25 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {ollamaBaixando
+                          ? `Baixando ${ollamaBaixando.modelo}… ${ollamaBaixando.percentual}% (${ollamaBaixando.status})`
+                          : `Instalar modelo ${(apiKeys?.osoneCodeOllamaModel || MODELOS_OLLAMA_PADRAO)} neste PC`}
+                      </button>
+                    </div>
+                    {ollamaAviso && (
+                      <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-[11px] text-zinc-300 leading-relaxed">
+                        {ollamaAviso}
+                      </div>
+                    )}
+                    <div className="text-[10px] text-zinc-600 leading-relaxed">
+                      O botão fala com o Agente Local (este mesmo computador). Se o Ollama ainda não estiver instalado,
+                      rode uma vez <span className="font-mono text-zinc-400">curl -fsSL https://ollama.com/install.sh | sh</span>{' '}
+                      (Linux/macOS) ou o instalador de ollama.com/download (Windows) — depois volte aqui e baixe o modelo.
+                    </div>
                   </div>
                 )}
 
